@@ -59,7 +59,7 @@ function waitForDocumentComplete(): Promise<void> {
 
 function doExtract(sendResponse: (r: ExtractResponse) => void) {
   try {
-    const raw = extractRaw()
+    const raw = extractRaw()  // 正则提取 返回 {title, byline, siteName, excerpt, contentHtml, articleElement}
     if (!raw) {
       sendResponse(
         fail('正文提取失败（页面结构可能太特殊，试试浏览器自带的"阅读模式"对比下）'),

@@ -21,10 +21,132 @@ export interface RawArticle {
   articleElement: HTMLElement
 }
 
-/** 跑 Readability 拿到正文；失败返回 null。 */
+/**
+ * 在 cloned document 上移除明显不属于正文的节点（评论 / 侧栏 / 导航 / 页脚）。
+ * 不污染原页面（只在 clone 上跑）。
+ *
+ * 适用范围：非知乎站点（v0.1.1 后知乎走专用 extractZhihu 路径，不调本函数）。
+ *
+ * ⚠️ 副作用评估（CLAUDE.md 协作约定"边角"）：
+ * - 用 `[role="complementary"]` 替代裸 `<aside>`：避免误伤 MDN 等站点的 `<aside>` 提示框
+ * - `[class*="comment" i]`：极少数站点可能用 "comment" 命名正文节点 → 接受这风险
+ *   （V2EX、简书等都是真的评论结构）
+ */
+export function patchDocForExtraction(doc: Document): void {
+  const noiseSelectors: string[] = [
+    '[role="complementary"]', // aside 区域
+    '[role="navigation"]', // 导航
+    '[class*="comment" i]', // 评论（CommentList 等 obfuscated class）
+    '[id*="comment" i]', // 同上（id 维度）
+    '[class*="Comment-Modal" i]', // 评论展开的 Modal
+    '[class*="Comment-List" i]',
+    'nav',
+    'footer',
+  ]
+  for (const sel of noiseSelectors) {
+    doc.querySelectorAll(sel).forEach((el) => el.remove())
+  }
+}
+
+/**
+ * 从 <meta> 标签提取 title / byline 覆盖（如果存在）。
+ * 知乎专栏场景：Readability 的 byline 可能被评论作者污染；
+ * 用 `<meta property="og:author">` / `<meta name="author">` 覆盖更稳。
+ */
+export function extractMetaOverrides(doc: Document): {
+  title?: string
+  byline?: string
+} {
+  const meta = (name: string): string | undefined => {
+    const el =
+      doc.querySelector(`meta[property="${name}"]`) ||
+      doc.querySelector(`meta[name="${name}"]`)
+    return el?.getAttribute("content")?.trim() || undefined
+  }
+  return {
+    title: meta("og:title") || meta("twitter:title"),
+    byline: meta("author") || meta("og:author") || meta("twitter:creator"),
+  }
+}
+
+/** 跑 Readability 拿到正文；失败返回 null。
+ *
+ * v0.1.1 知乎专用路径：question 主页多回答共存时，Readability 启发式不可靠，
+ * 直接用 schema.org 标记定位 wrapper + viewport 中央匹配 + data-zop 解析作者。
+ * 其它站点走原 Readability 路径不受影响。
+ */
 export function extractRaw(): RawArticle | null {
+  // 知乎：走专用路径，不依赖 Readability
+  if (location.host.includes("zhihu.com")) {
+    return extractZhihu()
+  }
+  return extractWithReadability()
+}
+
+/** 知乎专用提取：基于 schema.org Answer 标记 + viewport 中央匹配 */
+function extractZhihu(): RawArticle | null {
+  // 最稳 selector：schema.org Answer 标记（知乎自己用，改了会丢 SEO）
+  const wrappers = Array.from(
+    document.querySelectorAll('[itemtype="http://schema.org/Answer"]'),
+  )
+  if (wrappers.length === 0) return null
+
+  // 找视口中央的 wrapper（live document，layout 正常）
+  const viewportCenterY = window.innerHeight / 2
+  const visible = wrappers
+    .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+    .filter(({ rect }) => rect.bottom > 0 && rect.top < window.innerHeight * 2)
+    .sort((a, b) => {
+      const aCenter = a.rect.top + a.rect.height / 2
+      const bCenter = b.rect.top + b.rect.height / 2
+      return Math.abs(aCenter - viewportCenterY) - Math.abs(bCenter - viewportCenterY)
+    })
+  const targetWrapper = visible[0]?.el || wrappers[0]
+
+  // 作者：从 data-zop JSON 里取 authorName（HTML-encoded，需要解码）
+  let author: string | undefined
+  try {
+    const zopAttr = targetWrapper.getAttribute("data-zop")
+    if (zopAttr) {
+      const zop = JSON.parse(zopAttr.replace(/&quot;/g, '"')) as {
+        authorName?: string
+      }
+      author = zop.authorName
+    }
+  } catch {
+    // ignore — 知乎改版时 data-zop 格式可能变
+  }
+
+  // 标题：og:title 优先（如"互联网已经将绝大部分信息差..."）
+  const ogTitle = document
+    .querySelector('meta[property="og:title"]')
+    ?.getAttribute("content")
+  const title = ogTitle || document.title || "untitled"
+
+  // excerpt：正文 RichText 的前 200 字
+  const textSpan = targetWrapper.querySelector('[itemprop="text"]')
+  const excerpt = (textSpan?.textContent || "").slice(0, 200).trim()
+
+  // off-DOM 容器（保留 collectImageUrls 范围限定）
+  const wrapperClone = targetWrapper.cloneNode(true) as HTMLElement
+
+  return {
+    title,
+    byline: author,
+    siteName: "知乎",
+    excerpt: excerpt || undefined,
+    contentHtml: wrapperClone.innerHTML,
+    textContent: wrapperClone.textContent || "",
+    articleElement: wrapperClone,
+  }
+}
+
+/** 原 Readability 提取路径（其它站点用） */
+function extractWithReadability(): RawArticle | null {
   try {
     const docClone = document.cloneNode(true) as Document
+    // 先清掉评论 / 侧栏 / 导航噪声节点（修知乎专栏等长尾评论结构）
+    patchDocForExtraction(docClone)
     const reader = new Readability(docClone, {
       debug: false,
       charThreshold: 200,
@@ -32,13 +154,15 @@ export function extractRaw(): RawArticle | null {
     })
     const parsed = reader.parse()
     if (!parsed) return null
+    // meta 覆盖：知乎专栏 og:author / og:title 比 Readability 解析更准
+    const overrides = extractMetaOverrides(docClone)
     // off-DOM 容器：把 Readability 输出的 HTML 塞进一个 div，
     //   后续 collectImageUrls 只在这个子树里找 img，避免全页面噪声。
     const articleElement = document.createElement("div")
     articleElement.innerHTML = parsed.content || ""
     return {
-      title: parsed.title || document.title || "untitled",
-      byline: parsed.byline || undefined,
+      title: overrides.title || parsed.title || document.title || "untitled",
+      byline: overrides.byline || parsed.byline || undefined,
       siteName: parsed.siteName || undefined,
       excerpt: parsed.excerpt || undefined,
       contentHtml: parsed.content || "",
