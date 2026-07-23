@@ -2,6 +2,8 @@
 //   - 打开方式：右键点击扩展图标 → 选项；或在 chrome://extensions 详情页点"扩展程序选项"。
 //   - v0.3 将改造为：Token 输入框 + 知识库选择 + 父文档选择。
 
+import { createRoot } from "react-dom/client"
+
 function Options() {
   return (
     <div className="p-6 max-w-xl text-sm text-gray-700">
@@ -21,4 +23,12 @@ function Options() {
   )
 }
 
-export default Options
+// 挂载：options.html 里有 <div id="root"></div>，把 React 树挂上去。
+// （plasmo 迁出后必加，否则设置页打开是空白白页。）
+const container = document.getElementById("root")
+if (!container) throw new Error("#root not found in options.html")
+createRoot(container).render(<Options />)
+
+// 删了 `export default Options`：esbuild 以 IIFE 模式 bundle 入口，
+// 顶层 createRoot().render() 才是真正的 mount；export default 是 plasmo 时代残留，
+// 现在没人 import，留着会强制 emit exports 对象。

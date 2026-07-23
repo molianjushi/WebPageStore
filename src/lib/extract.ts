@@ -5,6 +5,7 @@
 //   它能访问页面的 DOM（只读），不会受页面 JS 干扰。
 // - Readability 接受 cloned document 进行解析（避免污染原页面）。
 // - Turndown 把清洗后的 HTML 转 Markdown。
+// - collectImageUrls 只扫 Readability 输出的 article 子树 —— 防止抓到广告 / 头像 / 侧栏。
 
 import { Readability } from "@mozilla/readability"
 import TurndownService from "turndown"
@@ -16,6 +17,8 @@ export interface RawArticle {
   excerpt?: string
   contentHtml: string
   textContent: string
+  /** Readability 输出的 article 元素（off-DOM 容器），用于 collectImageUrls 范围限定。 */
+  articleElement: HTMLElement
 }
 
 /** 跑 Readability 拿到正文；失败返回 null。 */
@@ -29,6 +32,10 @@ export function extractRaw(): RawArticle | null {
     })
     const parsed = reader.parse()
     if (!parsed) return null
+    // off-DOM 容器：把 Readability 输出的 HTML 塞进一个 div，
+    //   后续 collectImageUrls 只在这个子树里找 img，避免全页面噪声。
+    const articleElement = document.createElement("div")
+    articleElement.innerHTML = parsed.content || ""
     return {
       title: parsed.title || document.title || "untitled",
       byline: parsed.byline || undefined,
@@ -36,6 +43,7 @@ export function extractRaw(): RawArticle | null {
       excerpt: parsed.excerpt || undefined,
       contentHtml: parsed.content || "",
       textContent: parsed.textContent || "",
+      articleElement,
     }
   } catch (e) {
     console.error("[WebPageStore] Readability 失败", e)
@@ -43,15 +51,37 @@ export function extractRaw(): RawArticle | null {
   }
 }
 
-/** 收集正文内的 <img> URL，过滤掉过小 / data / blob 图。 */
-export function collectImageUrls(max = 30): string[] {
+/**
+ * 收集 article 子树里的 <img> URL，过滤掉过小 / data / blob 图。
+ *   - 范围限定在 `root` 子树里（v0.1 默认是 Readability 输出元素）；
+ *     不传则降级到全文档（兜底）。
+ *   - 取图顺序：currentSrc > src > 懒加载 data-src/srcset/lazy-src。
+ *
+ * ⚠️ off-DOM 路径的局限：
+ *   `root` 是 `document.createElement("div")` 后塞 innerHTML 的容器，未 attach 到 document。
+ *   对 detached 元素：`img.naturalWidth` / `img.width` 永远为 0，
+ *   `img.currentSrc` 永远为空（图片未加载）。
+ *   → 下面的小图 guard 仅在 fallback 到 `document` 路径时才会生效。
+ *   → `currentSrc` 永远走不到，只能用 src/data-src/srcset。
+ *   v0.2 接 images 下载时需要 attach 容器到 body 触发真实加载；v0.1 不下载图片，**不影响功能**。
+ */
+export function collectImageUrls(root: ParentNode | null = null, max = 30): string[] {
+  const scope = root ?? document
   const urls = new Set<string>()
-  const imgs = document.querySelectorAll("img")
+  const imgs = scope.querySelectorAll("img")
   for (const img of Array.from(imgs)) {
-    const src = (img.currentSrc || img.getAttribute("src") || "").trim()
+    const src =
+      (img.currentSrc ||
+        img.getAttribute("src") ||
+        img.getAttribute("data-src") ||
+        img.getAttribute("lazy-src") ||
+        (img.getAttribute("srcset") || "").split(",")[0]?.trim().split(/\s+/)[0] ||
+        "").trim()
     if (!src) continue
     if (src.startsWith("data:")) continue
     if (src.startsWith("blob:")) continue
+    // 小图过滤：仅当 image 已 attach 到 document 且已加载（naturalWidth > 0）时生效；
+    // off-DOM 路径下两个 guard 都因 naturalWidth/width == 0 永不触发（已知，见上）。
     if (img.naturalWidth > 0 && img.naturalWidth < 50) continue
     if (img.width > 0 && img.width < 50) continue
     urls.add(src)
@@ -60,8 +90,11 @@ export function collectImageUrls(max = 30): string[] {
   return Array.from(urls)
 }
 
-/** Turndown 把 HTML 转 Markdown。 */
-export function htmlToMarkdown(html: string): string {
+/**
+ * Turndown 把 HTML 转 Markdown。
+ *   - `input` 可为 HTML 字符串或 Element；Element 路径省一次 DOM parse。
+ */
+export function htmlToMarkdown(input: string | HTMLElement): string {
   const td = new TurndownService({
     headingStyle: "atx",
     codeBlockStyle: "fenced",
@@ -101,14 +134,52 @@ export function htmlToMarkdown(html: string): string {
   ])
 
   try {
-    return td.turndown(html)
+    return td.turndown(input)
   } catch (e) {
     console.error("[WebPageStore] Turndown 失败", e)
-    return html
+    return typeof input === "string" ? input : input.outerHTML
   }
 }
 
-/** 在 Markdown 顶部加一段 YAML front matter，便于归档后追溯。 */
+/**
+ * YAML scalar string 转义：所有 frontmatter 字段值走它。
+ *
+ * 选择策略：统一用双引号包 + 转义内部 `"` 和 `\`。原因：
+ *   - 比"用单引号再转义单引号"简单直观；
+ *   - 比"用 block scalar `|` 然后每行加 `> `"更省字节；
+ *   - 不依赖任何第三方 YAML 库；
+ *   - 兜底：任何含控制字符 / 无法表达的值会抛错。
+ *
+ * YAML 双引号规则（YAML 1.2 §7.3.1）：
+ *   - `\` → `\\`
+ *   - `"` → `\"`
+ *   - `\n` → `\n` （折行：YAML 会把单个 LF 折成空格；为可读性写成 \\n）
+ *   - `\r` → `\r`
+ *   - `\t` → `\t`
+ *   - 其它控制字符（\x00-\x08, \x0b, \x0c, \x0e-\x1f, \x7f）→ 抛错
+ */
+export function yamlEscape(value: string): string {
+  if (value == null) return '""'
+  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)) {
+    throw new Error("YAML scalar 包含非法控制字符")
+  }
+  return (
+    '"' +
+    value
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, "\\n")
+      .replace(/\r/g, "\\r")
+      .replace(/\t/g, "\\t") +
+    '"'
+  )
+}
+
+/** 在 Markdown 顶部加一段 YAML front matter，便于归档后追溯。
+ *
+ * 关键：末尾多一个空行（closing `---` + `\n` + `\n`），避免下游 Hugo / Jekyll /
+ * pandoc 把第一行 markdown 吞进 frontmatter block。
+ */
 export function prependFrontMatter(meta: {
   title: string
   sourceUrl: string
@@ -118,12 +189,14 @@ export function prependFrontMatter(meta: {
   fetchedAt: string
 }): string {
   const yamlLines = ["---"]
-  yamlLines.push(`title: ${meta.title}`)
-  yamlLines.push(`source: ${meta.sourceUrl}`)
-  if (meta.byline) yamlLines.push(`author: ${meta.byline}`)
-  if (meta.siteName) yamlLines.push(`site: ${meta.siteName}`)
-  if (meta.excerpt) yamlLines.push(`excerpt: ${meta.excerpt}`)
-  yamlLines.push(`fetched_at: ${meta.fetchedAt}`)
-  yamlLines.push("---", "")
+  yamlLines.push(`title: ${yamlEscape(meta.title)}`)
+  yamlLines.push(`source: ${yamlEscape(meta.sourceUrl)}`)
+  if (meta.byline) yamlLines.push(`author: ${yamlEscape(meta.byline)}`)
+  if (meta.siteName) yamlLines.push(`site: ${yamlEscape(meta.siteName)}`)
+  if (meta.excerpt) yamlLines.push(`excerpt: ${yamlEscape(meta.excerpt)}`)
+  yamlLines.push(`fetched_at: ${yamlEscape(meta.fetchedAt)}`)
+  // 两个空字符串 → `---` + `\n` + `\n`（一个换行结束 yamlLines.join 的行，
+  // 另一个作为 frontmatter 与正文的空行分隔）
+  yamlLines.push("---", "", "")
   return yamlLines.join("\n")
 }

@@ -2,35 +2,25 @@
   "name": "web-page-store",
   "version": "0.1.0",
   "description": "智能网页剪存插件 —— 一键把网页保存为 Markdown（含本地 / 语雀两种目标）",
-  "type": "module",
   "scripts": {
-    "dev": "plasmo dev",
-    "build": "plasmo build",
-    "package": "plasmo package",
-    "preview": "plasmo preview"
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@mozilla/readability": "^0.5.0",
     "turndown": "^7.2.0"
   },
   "devDependencies": {
-    "@plasmohq/messaging": "^0.6.0",
-    "@plasmohq/storage": "^1.7.0",
     "@types/chrome": "^0.0.270",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "@types/turndown": "^5.0.5",
     "autoprefixer": "^10.4.20",
-    "plasmo": "^0.90.5",
+    "esbuild": "^0.28.1",
     "postcss": "^8.4.49",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "tailwindcss": "^3.4.0",
-    "typescript": "^5.4.0"
-  },
-  "manifest": {
-    "name": "WebPageStore",
-    "host_permissions": ["<all_urls>"],
-    "permissions": ["scripting", "activeTab", "downloads", "storage"]
+    "typescript": "^5.9.3"
   }
 }

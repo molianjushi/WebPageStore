@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "WebPageStore",
+  "version": "0.1.0",
+  "description": "智能网页剪存插件 —— 一键把网页保存为 Markdown（含本地 / 语雀两种目标）",
+  "icons": {
+    "16": "assets/icon_16.png",
+    "32": "assets/icon_32.png",
+    "48": "assets/icon_48.png",
+    "128": "assets/icon_128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "assets/icon_16.png",
+      "32": "assets/icon_32.png",
+      "48": "assets/icon_48.png",
+      "128": "assets/icon_128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "permissions": ["activeTab", "downloads", "storage", "scripting"]
+}

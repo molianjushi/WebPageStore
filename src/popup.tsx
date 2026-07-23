@@ -1,20 +1,22 @@
-// popup 主组件。打开 popup 时自动向当前标签页的 content script 发"extract"消息，
-// 拿到结构化结果后展示，让用户编辑标题 / 触发保存。
+// popup 主组件。打开 popup 时主动抓取当前标签页的正文，让用户编辑标题 / 触发保存。
 //
 // 关键决策：
-// 1. 用 chrome.tabs.sendMessage（不是 chrome.runtime.sendMessage）——
-//    前者能把消息路由到 *当前 tab* 的 content script，后者只能到 background。
+// 1. popup 自己查当前 tab 拿 tabId，再 chrome.runtime.sendMessage({tabId}) 给 background。
+//    这是 v0.1 的关键改动：service worker 不能用 `tabs.query({currentWindow:true})`，
+//    所以由 popup（自然绑定一个 window）传 tabId。
 // 2. 弹出即自动抓取，不做"重新提取"按钮 —— v0.1 内容提取稳定，少一次点击。
 // 3. 标题 input 可编辑，避免 Readability 取错标题时无法修正。
 // 4. "保存到语雀"按钮 disabled + 标 v0.3 —— 提前占位，避免误点。
-// 5. 直接用 chrome.runtime.sendMessage 转发到 background，绕过 @plasmohq/messaging
-//    这一层抽象（少学一套 API，减少小白的心智负担）。
+// 5. 跳过 @plasmohq/messaging 这一层抽象（少学一套 API，减少小白的心智负担）。
 //
 // 兼容性：MV3 popup 在用户点扩展图标时打开，点击外侧自动关闭；所以"保存中..."状态
 // 必须很快返回（download 是 ms 级），不要在这里放超过 1s 的 IO。
 
 import { useEffect, useState } from "react"
+import { createRoot } from "react-dom/client"
 import "./popup.css"
+import { errMsg } from "./lib/util"
+import { INJECT_FAIL_HINT } from "./lib/messages"
 import type { ExtractResponse, LocalSaveResponse } from "./types"
 
 type UiState =
@@ -29,11 +31,13 @@ export default function Popup() {
   const [state, setState] = useState<UiState>({ kind: "loading" })
   const [title, setTitle] = useState("")
 
-  // 挂载时主动抓取当前页
+  // 挂载时主动抓取当前页 —— 走 background 中转，由 background 按需注入 content script。
   useEffect(() => {
     let cancelled = false
     ;(async () => {
       try {
+        // popup 自然绑定一个 window，自己查当前 tab 拿 tabId
+        // （service worker 没有 currentWindow 概念，必须由 popup 传过去）。
         const [tab] = await chrome.tabs.query({
           active: true,
           currentWindow: true,
@@ -42,10 +46,11 @@ export default function Popup() {
           if (!cancelled) setState({ kind: "error", message: "找不到当前标签页" })
           return
         }
-
-        // 走 tabs.sendMessage 会路由到该 tab 的 content.ts
-        const res = (await chrome.tabs.sendMessage(tab.id, {
-          type: "extract",
+        // 不再 chrome.tabs.sendMessage：content script 已不再常驻（manifest 不声明 content_scripts）。
+        // 这里让 background 接管：先试 sendMessage（已注入则直接拿结果）→ 否则注入 content.js → 再 sendMessage。
+        const res = (await chrome.runtime.sendMessage({
+          type: "popupExtract",
+          tabId: tab.id,
         })) as ExtractResponse
 
         if (cancelled) return
@@ -56,13 +61,10 @@ export default function Popup() {
           setState({ kind: "ready", data: res })
         }
       } catch (e: any) {
-        // 异常常见原因：content script 被页面 CSP 拒了 / 当前 tab 不是 http(s)
         if (!cancelled)
           setState({
             kind: "error",
-            message:
-              (e?.message ?? String(e)) +
-              "（提示：当前页可能无法注入脚本，例如 chrome:// 页面、PDF、严格的 CSP 站点）",
+            message: errMsg(e) + INJECT_FAIL_HINT,
           })
       }
     })()
@@ -72,6 +74,9 @@ export default function Popup() {
   }, [])
 
   async function handleSaveLocal() {
+    // 修复 retry no-op bug：原代码这里写 `if (state.kind !== "ready") return`，
+    // 导致 saveFailed 分支的"重试"按钮点不动。
+    // 改成：只有 ready 分支有 state.data；其他分支的 retry 由按钮单独处理（见 saveFailed 分支）。
     if (state.kind !== "ready") return
     setState({ kind: "saving" })
     try {
@@ -92,8 +97,56 @@ export default function Popup() {
         setState({ kind: "saveFailed", message: res.error })
       }
     } catch (e: any) {
-      setState({ kind: "saveFailed", message: e?.message ?? String(e) })
+      setState({ kind: "saveFailed", message: errMsg(e) })
     }
+  }
+
+  // saveFailed 分支的"重试"按钮：保留 ready 状态以复用 handleSaveLocal。
+  function handleRetrySave() {
+    // 把 UI 倒回 ready，让 handleSaveLocal 能正常走 ready 分支。
+    // 注意：data 已经丢了（state 切换到 saveFailed 后被覆盖），
+    // 所以 retry 实际上要重新跑 extract —— 通过 setState("loading") 让用户感知。
+    setState({ kind: "loading" })
+    // 重新触发 useEffect 等价动作：手动重新查 tab + sendMessage。
+    ;(async () => {
+      try {
+        const [tab] = await chrome.tabs.query({
+          active: true,
+          currentWindow: true,
+        })
+        if (!tab?.id) {
+          setState({ kind: "error", message: "找不到当前标签页" })
+          return
+        }
+        const res = (await chrome.runtime.sendMessage({
+          type: "popupExtract",
+          tabId: tab.id,
+        })) as ExtractResponse
+        if (!res.ok) {
+          setState({ kind: "error", message: res.error })
+          return
+        }
+        setTitle(res.title || "")
+        setState({ kind: "ready", data: res })
+        // 抓到后立刻重试保存
+        const saveRes = (await chrome.runtime.sendMessage({
+          type: "saveLocal",
+          payload: {
+            title: res.title,
+            markdown: res.markdown,
+            sourceUrl: res.sourceUrl,
+          },
+        })) as LocalSaveResponse
+        if (saveRes.ok) {
+          setState({ kind: "saved", filename: saveRes.filename })
+          setTimeout(() => window.close(), 1500)
+        } else {
+          setState({ kind: "saveFailed", message: saveRes.error })
+        }
+      } catch (e: any) {
+        setState({ kind: "saveFailed", message: errMsg(e) })
+      }
+    })()
   }
 
   // --- 渲染分支 ---
@@ -137,7 +190,7 @@ export default function Popup() {
           </div>
         </div>
         <button
-          onClick={handleSaveLocal}
+          onClick={handleRetrySave}
           className="mt-3 w-full px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded"
         >
           重试
@@ -170,7 +223,7 @@ export default function Popup() {
         placeholder={data?.title}
         className="w-full px-2 py-1.5 text-sm border border-gray-300 rounded mb-2 focus:outline-none focus:border-blue-500"
       />
-
+      <label className="block text-xs text-gray-500 mb-1">描述</label>
       {data?.excerpt && (
         <div className="bg-gray-50 border border-gray-200 p-2 rounded text-xs text-gray-600 mb-3 max-h-24 overflow-auto leading-relaxed">
           {data.excerpt}
@@ -221,3 +274,13 @@ function Shell({ children }: { children: React.ReactNode }) {
     </div>
   )
 }
+
+// 挂载：popup.html 里有 <div id="root"></div>，这里把 React 树挂上去。
+// （plasmo 迁出后必加，否则 popup 打开是空白白页。）
+const container = document.getElementById("root")
+if (!container) throw new Error("#root not found in popup.html")
+createRoot(container).render(<Popup />)
+
+// 删了原本的 `export default Popup`：esbuild 以 IIFE 模式 bundle 入口，
+// 入口文件顶层 createRoot().render() 才是真正的 mount；export default 是 plasmo 时代的
+// 残留（plasmo 会读 default export 当入口组件），现在没人 import，留着会强制 emit exports 对象。
