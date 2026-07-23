@@ -1,4 +1,4 @@
-// content.ts 用的提取层：Readability + Turndown + 图片收集 + YAML front matter。
+// content.ts 用的提取层：Readability + Turndown + 图片收集 + markdown 引用块 frontmatter。
 //
 // 设计要点：
 // - Plasmo 默认把 src/content.ts 编译为 ISOLATED world content script，
@@ -6,6 +6,9 @@
 // - Readability 接受 cloned document 进行解析（避免污染原页面）。
 // - Turndown 把清洗后的 HTML 转 Markdown。
 // - collectImageUrls 只扫 Readability 输出的 article 子树 —— 防止抓到广告 / 头像 / 侧栏。
+// - prependFrontMatter 用 markdown 引用块（`> ` 前缀）输出元数据：每个字段加 emoji 前缀，
+//   key 改中文（标题 / 原文链接 / 作者 / 站点 / 摘要 / 抓取时间）+ 末尾加署名行。
+//   注意：放弃 YAML 语法（不再 pandoc/hugo 兼容）；用户视觉一致性优先。
 
 import { Readability } from "@mozilla/readability"
 import TurndownService from "turndown"
@@ -265,44 +268,17 @@ export function htmlToMarkdown(input: string | HTMLElement): string {
   }
 }
 
-/**
- * YAML scalar string 转义：所有 frontmatter 字段值走它。
+/** 在 Markdown 顶部加一段引用块 frontmatter，便于归档后追溯。
  *
- * 选择策略：统一用双引号包 + 转义内部 `"` 和 `\`。原因：
- *   - 比"用单引号再转义单引号"简单直观；
- *   - 比"用 block scalar `|` 然后每行加 `> `"更省字节；
- *   - 不依赖任何第三方 YAML 库；
- *   - 兜底：任何含控制字符 / 无法表达的值会抛错。
+ * 输出格式（每行 `> ` 前缀 + emoji 装饰）：
+ *   > 📖 标题: "..."
+ *   > 🔗 原文链接: "[原文链接](https://...)"
+ *   > 🤵 作者: "..."
+ *   > ...
+ *   > ✂️ 本文由WebPageStore（网页剪存）一键剪存
  *
- * YAML 双引号规则（YAML 1.2 §7.3.1）：
- *   - `\` → `\\`
- *   - `"` → `\"`
- *   - `\n` → `\n` （折行：YAML 会把单个 LF 折成空格；为可读性写成 \\n）
- *   - `\r` → `\r`
- *   - `\t` → `\t`
- *   - 其它控制字符（\x00-\x08, \x0b, \x0c, \x0e-\x1f, \x7f）→ 抛错
- */
-export function yamlEscape(value: string): string {
-  if (value == null) return '""'
-  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)) {
-    throw new Error("YAML scalar 包含非法控制字符")
-  }
-  return (
-    '"' +
-    value
-      .replace(/\\/g, "\\\\")
-      .replace(/"/g, '\\"')
-      .replace(/\n/g, "\\n")
-      .replace(/\r/g, "\\r")
-      .replace(/\t/g, "\\t") +
-    '"'
-  )
-}
-
-/** 在 Markdown 顶部加一段 YAML front matter，便于归档后追溯。
- *
- * 关键：末尾多一个空行（closing `---` + `\n` + `\n`），避免下游 Hugo / Jekyll /
- * pandoc 把第一行 markdown 吞进 frontmatter block。
+ * 注意：放弃 YAML 语法 —— 引用块在 markdown viewer 里视觉是引用，但不进 pandoc /
+ * hugo / jekyll frontmatter 解析。如果将来要恢复机器可读 frontmatter，再叠一段 YAML。
  */
 export function prependFrontMatter(meta: {
   title: string
@@ -312,15 +288,18 @@ export function prependFrontMatter(meta: {
   excerpt?: string
   fetchedAt: string
 }): string {
-  const yamlLines = ["---"]
-  yamlLines.push(`title: ${yamlEscape(meta.title)}`)
-  yamlLines.push(`source: ${yamlEscape(meta.sourceUrl)}`)
-  if (meta.byline) yamlLines.push(`author: ${yamlEscape(meta.byline)}`)
-  if (meta.siteName) yamlLines.push(`site: ${yamlEscape(meta.siteName)}`)
-  if (meta.excerpt) yamlLines.push(`excerpt: ${yamlEscape(meta.excerpt)}`)
-  yamlLines.push(`fetched_at: ${yamlEscape(meta.fetchedAt)}`)
-  // 两个空字符串 → `---` + `\n` + `\n`（一个换行结束 yamlLines.join 的行，
-  // 另一个作为 frontmatter 与正文的空行分隔）
-  yamlLines.push("---", "", "")
-  return yamlLines.join("\n")
+  const lines: string[] = []
+  // 每行 `> ` 前缀 → markdown 渲染时整个 frontmatter 区段是引用块
+  lines.push(`> 📖 标题: "${meta.title}"`)
+  // 原文链接用 markdown 链接文本格式，emoji 起视觉装饰
+  lines.push(`> 🔗 原文链接: "[原文链接](${meta.sourceUrl})"`)
+  if (meta.byline) lines.push(`> 🤵 作者: "${meta.byline}"`)
+  if (meta.siteName) lines.push(`> ♻️ 站点: "${meta.siteName}"`)
+  if (meta.excerpt) lines.push(`> 🎈 摘要: "${meta.excerpt}"`)
+  lines.push(`> ⏱️ 抓取时间: "${meta.fetchedAt}"`)
+  // 末尾固定署名行（去掉方括号 —— 按用户 B 选项）
+  lines.push(`> ✂️ 本文由WebPageStore（网页剪存）一键剪存`)
+  // 引用块末尾留两个空行（按用户 A 选项），区分正文开始
+  lines.push("", "")
+  return lines.join("\n")
 }
