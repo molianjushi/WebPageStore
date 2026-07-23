@@ -1,0 +1,10 @@
+node_modules/
+.plasmo/
+build/
+dist/
+*.log
+.DS_Store
+.idea/
+.vscode/
+.env*
+.claude/

@@ -1,0 +1,5 @@
+/* Tailwind 入口 —— popup 弹窗引入这份 CSS 即可获得工具类。
+   注意 Plasmo 会自动给 .tsx 同名 .css 生成独立的样式注入。 */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
