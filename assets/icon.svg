@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WebPageStore 图标（SVG 源文件）。
+     设计：蓝色圆角方背景 + 白色文档 + 蓝色剪刀（覆盖在文档右上"剪下"）。
+     配色：主蓝 #2563eb（与 popup 主按钮同色 / 深蓝 #1d4ed8 折角 / 文字行 #cbd5e1）。
+     渲染：node build-icons.mjs → sharp resize → 16/32/48/128 PNG。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- 圆角方背景 -->
+  <rect width="128" height="128" rx="28" ry="28" fill="#2563eb"/>
+
+  <!-- 文档主体（白色） -->
+  <path d="M 24 30 L 76 30 L 92 46 L 92 102 L 24 102 Z" fill="white"/>
+  <!-- 文档折角（深蓝） -->
+  <path d="M 76 30 L 76 46 L 92 46 Z" fill="#1d4ed8"/>
+  <!-- 文档内文字行（蓝灰色，模拟文字） -->
+  <rect x="34" y="58" width="48" height="3" rx="1.5" fill="#cbd5e1"/>
+  <rect x="34" y="68" width="48" height="3" rx="1.5" fill="#cbd5e1"/>
+  <rect x="34" y="78" width="36" height="3" rx="1.5" fill="#cbd5e1"/>
+  <rect x="34" y="88" width="44" height="3" rx="1.5" fill="#cbd5e1"/>
+
+  <!-- 剪刀（覆盖在文档右上角，表达"剪下"动作） -->
+  <g transform="translate(82 38) rotate(-30)">
+    <!-- 中心轴（黄色，强调剪刀支点） -->
+    <circle cx="0" cy="0" r="3.5" fill="#fbbf24"/>
+    <!-- 上刃（细长三角，指向右上） -->
+    <path d="M 0 -2 L 28 -14 L 32 -10 L 4 2 Z" fill="white" stroke="#1e3a8a" stroke-width="2" stroke-linejoin="round"/>
+    <!-- 下刃（细长三角，指向右下） -->
+    <path d="M 0 2 L 28 14 L 32 10 L 4 -2 Z" fill="white" stroke="#1e3a8a" stroke-width="2" stroke-linejoin="round"/>
+    <!-- 把手圆环（左侧） -->
+    <circle cx="-12" cy="0" r="9" fill="white" stroke="#1e3a8a" stroke-width="3"/>
+    <circle cx="-12" cy="0" r="3.5" fill="#1e3a8a"/>
+  </g>
+</svg>

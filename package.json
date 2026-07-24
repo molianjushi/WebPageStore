@@ -4,6 +4,7 @@
   "description": "智能网页剪存插件 —— 一键把网页保存为 Markdown（含本地 / 语雀两种目标）",
   "scripts": {
     "build": "node build.mjs",
+    "icons": "node build-icons.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -20,6 +21,7 @@
     "postcss": "^8.4.49",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "sharp": "^0.35.3",
     "tailwindcss": "^3.4.0",
     "typescript": "^5.9.3"
   }

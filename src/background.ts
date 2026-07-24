@@ -7,17 +7,40 @@
 //   2. 响应 popup 的 "saveLocal" 消息：data URL → chrome.downloads
 //      优化：size guard 按 encodeURIComponent 后长度 + CJK 膨胀预算（1.9MB 不够，要更小）。
 //   3. 安装时给个空欢迎。
+//
+// 职责（v0.3 新增）：
+//   4. setYuqueConfig / clearYuqueConfig —— 读写 storage.local
+//      （getYuqueConfig 已移到 popup/options 直接 import —— chrome.storage.local
+//       在 popup context 可直接访问，不需要再绕 background）
+//   5. yuqueSanity —— 串行 getUser + getRepo，验 token + namespace 同时返回 login/repo 信息
+//   6. yuqueUpload —— createDoc 推 markdown 文档
 
 import { sanitizeFilename, timestampForFilename } from "./lib/sanitize"
 import { errMsg, lastErrorMsg } from "./lib/util"
+import { getYuqueConfig, setYuqueConfig, clearYuqueConfig } from "./lib/storage"
+import { getUser, getRepo, createDoc } from "./lib/yuque"
 import { INJECT_FAIL_HINT, NON_HTTP_TAB_MSG } from "./lib/messages"
 import {
   fail,
   okSave,
+  okYuqueSanity,
+  okYuqueUpload,
+  type ClearYuqueConfigRequest,
+  type ClearYuqueConfigResponse,
   type ExtractResponse,
   type LocalSaveRequest,
   type LocalSaveResponse,
   type PopupExtractRequest,
+  type SetYuqueConfigRequest,
+  type SetYuqueConfigResponse,
+  type YuqueSanityCode,
+  type YuqueSanityFailure,
+  type YuqueSanityRequest,
+  type YuqueSanityResponse,
+  type YuqueUploadCode,
+  type YuqueUploadFailure,
+  type YuqueUploadRequest,
+  type YuqueUploadResponse,
 } from "./types"
 
 /**
@@ -28,6 +51,16 @@ import {
  * 取 600_000 留点余量。
  */
 const MAX_DATA_URL_CHARS = 600_000
+
+// ---- v0.3 失败工厂（带 code 字段） ----
+
+function failSanity(error: string, code: YuqueSanityCode): YuqueSanityFailure {
+  return { ok: false, error, code }
+}
+
+function failUpload(error: string, code: YuqueUploadCode): YuqueUploadFailure {
+  return { ok: false, error, code }
+}
 
 /**
  * 把当前 tab 抓出来给 content 跑 extract。
@@ -136,13 +169,123 @@ function handleSaveLocal(
   }
 }
 
+// ---- v0.3 handlers ----
+
+/** 写 storage 里的 yuqueConfig。trim 后判非空。 */
+function handleSetYuqueConfig(
+  req: SetYuqueConfigRequest,
+  sendResponse: (r: SetYuqueConfigResponse) => void,
+) {
+  const cfg = req?.config
+  if (!cfg || !cfg.token?.trim() || !cfg.namespace?.trim()) {
+    sendResponse({ ok: false, error: "Token 和 namespace 都不能为空" })
+    return
+  }
+  void setYuqueConfig({ token: cfg.token.trim(), namespace: cfg.namespace.trim() })
+    .then(() => sendResponse({ ok: true }))
+    .catch((e) => sendResponse({ ok: false, error: errMsg(e) }))
+}
+
+/** 清 storage 里的 yuqueConfig。 */
+function handleClearYuqueConfig(
+  sendResponse: (r: ClearYuqueConfigResponse) => void,
+) {
+  void clearYuqueConfig()
+    .then(() => sendResponse({ ok: true }))
+    .catch((e) => sendResponse({ ok: false, error: errMsg(e) }))
+}
+
+/** sanity check：先 getUser 验 token，再 getRepo 验 namespace；任一失败 fail-fast。
+ *
+ * 串行而非并行：namespace 错的 user 大概率也对（避免两次 HTTP 错叠加）。
+ * 外层 try/catch 兜底：yuque.ts 抛错（200 + 非 JSON / envelope 异常）也保证 sendResponse 调到。
+ */
+async function handleYuqueSanity(
+  sendResponse: (r: YuqueSanityResponse) => void,
+): Promise<void> {
+  try {
+    const cfg = await getYuqueConfig()
+    if (!cfg) {
+      sendResponse(failSanity("未配置 Token + namespace", "no_token"))
+      return
+    }
+    const userRes = await getUser(cfg.token)
+    if (!userRes.ok) {
+      sendResponse(failSanity(userRes.error, userRes.code))
+      return
+    }
+    const repoRes = await getRepo(cfg.token, cfg.namespace)
+    if (!repoRes.ok) {
+      sendResponse(failSanity(repoRes.error, repoRes.code))
+      return
+    }
+    sendResponse(
+      okYuqueSanity({
+        login: userRes.login,
+        repoTitle: repoRes.title,
+        publicLevel: repoRes.publicLevel,
+      }),
+    )
+  } catch (e) {
+    sendResponse(failSanity(errMsg(e), "network"))
+  }
+}
+
+/** 推 markdown 到语雀（v0.3 最小版：推知识库根目录，不传 parent_uuid）。
+ * 外层 try/catch 同 handleYuqueSanity。*/
+async function handleYuqueUpload(
+  req: YuqueUploadRequest,
+  sendResponse: (r: YuqueUploadResponse) => void,
+): Promise<void> {
+  try {
+    const cfg = await getYuqueConfig()
+    if (!cfg) {
+      sendResponse(failUpload("未配置 Token + namespace", "no_token"))
+      return
+    }
+    const { title, markdown } = req?.payload ?? ({} as { title?: string; markdown?: string })
+    if (!markdown) {
+      // 区分空 markdown 和真网络错误 —— 用专门的 "no_markdown" code，popup 不误导成"网络错"。
+      sendResponse(failUpload("没有可上传的 Markdown 内容", "no_markdown"))
+      return
+    }
+    const createRes = await createDoc(cfg.token, cfg.namespace, {
+      title: title?.trim() || "untitled",
+      body: markdown,
+    })
+    if (!createRes.ok) {
+      sendResponse(failUpload(createRes.error, createRes.code))
+      return
+    }
+    sendResponse(
+      okYuqueUpload({ docUrl: createRes.docUrl, docId: createRes.docId }),
+    )
+  } catch (e) {
+    sendResponse(failUpload(errMsg(e), "network"))
+  }
+}
+
 chrome.runtime.onMessage.addListener(
   (
     req: unknown,
     _sender,
-    sendResponse: (r: ExtractResponse | LocalSaveResponse) => void,
+    sendResponse: (
+      r:
+        | ExtractResponse
+        | LocalSaveResponse
+        | SetYuqueConfigResponse
+        | ClearYuqueConfigResponse
+        | YuqueSanityResponse
+        | YuqueUploadResponse,
+    ) => void,
   ) => {
-    const m = req as PopupExtractRequest | LocalSaveRequest
+    const m = req as
+      | PopupExtractRequest
+      | LocalSaveRequest
+      | SetYuqueConfigRequest
+      | ClearYuqueConfigRequest
+      | YuqueSanityRequest
+      | YuqueUploadRequest
 
     // ---- 分支 1：popup 触发抓取（→ 优先 sendMessage，失败再注入 content） ----
     if (m?.type === "popupExtract") {
@@ -155,19 +298,54 @@ chrome.runtime.onMessage.addListener(
       return true // 异步 sendResponse
     }
 
-    // ---- 分支 2：popup 触发保存 ----
+    // ---- 分支 2：popup 触发本地保存 ----
     if (m?.type === "saveLocal") {
       handleSaveLocal(m as LocalSaveRequest, sendResponse as (r: LocalSaveResponse) => void)
       return true // 异步 sendResponse（chrome.downloads 回调）
+    }
+
+    // 注意：getYuqueConfig 已删除 —— popup / options 都直接 import storage.getYuqueConfig()，
+    // chrome.storage.local 在 popup context 里可直接访问，没必要绕 background。
+
+    // ---- v0.3 分支 3：options 写 config ----
+    if (m?.type === "setYuqueConfig") {
+      handleSetYuqueConfig(
+        m as SetYuqueConfigRequest,
+        sendResponse as (r: SetYuqueConfigResponse) => void,
+      )
+      return true
+    }
+
+    // ---- v0.3 分支 4：options 清 config ----
+    if (m?.type === "clearYuqueConfig") {
+      handleClearYuqueConfig(sendResponse as (r: ClearYuqueConfigResponse) => void)
+      return true
+    }
+
+    // ---- v0.3 分支 5：options sanity check ----
+    if (m?.type === "yuqueSanity") {
+      void handleYuqueSanity(sendResponse as (r: YuqueSanityResponse) => void)
+      return true
+    }
+
+    // ---- v0.3 分支 6：popup 上传到语雀 ----
+    if (m?.type === "yuqueUpload") {
+      void handleYuqueUpload(
+        m as YuqueUploadRequest,
+        sendResponse as (r: YuqueUploadResponse) => void,
+      )
+      return true
     }
 
     return false
   },
 )
 
-// 安装时给个空欢迎 —— 后续 v0.3 这里写"语雀首次配置引导"。
+// 安装时给个空欢迎 —— v0.3 提示语雀首次配置
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === "install") {
-    console.log("[WebPageStore] 已安装 ~ v0.1 仅支持本地 .md 下载")
+    console.log(
+      "[WebPageStore] 已安装 ~ v0.3：本地 .md + 语雀 API 上传。先到选项页配置 Token + namespace。",
+    )
   }
 })
